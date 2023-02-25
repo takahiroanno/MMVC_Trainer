@@ -122,11 +122,10 @@ def mozi2phone(wavlm, wav_path, d_):
     else:
         source, sr = torchaudio.load(wav_path)
         source = torchaudio.functional.resample(source, sr, 16000)
-        source = source.unsqueeze(0)
-
-        c = utils.get_content(wavlm, source)
-        #units = hubert.units(source).numpy().squeeze(0)
-        np.save(save_path, c.numpy().cpu())
+        with torch.no_grad():
+            c = wavlm.extract_features(source)[0]
+        c = c.transpose(1, 2)
+        np.save(save_path, c.numpy())
     return save_path + ".npy"
 
 #filelistの1行を作成する

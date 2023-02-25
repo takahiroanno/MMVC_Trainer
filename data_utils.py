@@ -408,7 +408,7 @@ class TextAudioSpeakerLoaderFreeVC(torch.utils.data.Dataset):
         return audio_norm
 
     def __getitem__(self, index):
-        return self.get_audio(self.audiopaths[index][0])
+        return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
 
     def __len__(self):
         return len(self.audiopaths)
