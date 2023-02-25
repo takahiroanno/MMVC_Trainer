@@ -259,10 +259,10 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
     with autocast(enabled=hps.train.fp16_run):
       (outs, tgt_outs), ids_slice, _, z_mask,\
-        ((z, z_p, m_p), logs_p, m_q, logs_q) = net_g(x, x_lengths, spec, spec_lengths, sin, d, slice_id, speakers, target_ids)
+        ((_, z_p, m_p), logs_p, _, logs_q) = net_g(x, x_lengths, spec, spec_lengths, sin, d, slice_id, speakers, target_ids)
       y_mel = commons.slice_segments(mel, ids_slice, spec_segment_size)
     y_hat, y_reg = outs
-    tgt_y_hat, tgt_y_reg = tgt_outs
+    tgt_y_hat, _ = tgt_outs
 
     y_hat = y_hat.float()
     y_hat_mel = mel_spectrogram_torch_data(y_hat.squeeze(1), hps.data)
@@ -283,7 +283,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
 
     with autocast(enabled=False):
       #loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_true, y_fake)
-      loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(y_d_hat_r, y_d_hat_g)
+      loss_disc, _, _ = discriminator_loss(y_d_hat_r, y_d_hat_g)
       loss_disc_all = loss_disc
     optim_d.zero_grad()
     scaler.scale(loss_disc_all).backward()
@@ -316,7 +316,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         #loss_fm = feature_loss(fmap_true, fmap_fake)
         #loss_gen, losses_gen = generator_loss(y_fake)
         loss_fm = feature_loss(fmap_r, fmap_g)
-        loss_gen, losses_gen = generator_loss(y_d_hat_g)
+        loss_gen, _ = generator_loss(y_d_hat_g)
         loss_gen_all = loss_gen + loss_fm + loss_mel + loss_kl + loss_hubert + reg_loss
 
     optim_g.zero_grad()
@@ -343,11 +343,8 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, schedulers, scaler, loade
         logger.info([x.item() for x in losses] + [global_step, lr])
         
         scalar_dict = {"loss/g/total": loss_gen_all_cpu, "loss/d/total": loss_disc_all_cpu, "learning_rate": lr, "grad_norm_d": grad_norm_d, "grad_norm_g": grad_norm_g}
-        scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/hubert": loss_hubert, "loss/g/kl": loss_kl})
+        scalar_dict.update({"loss/g/fm": loss_fm, "loss/g/mel": loss_mel, "loss/g/hubert": loss_hubert, "loss/g/kl": loss_kl, "loss/g/reg": reg_loss})
 
-        scalar_dict.update({"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)})
-        scalar_dict.update({"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)})
-        scalar_dict.update({"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)})
         image_dict = { 
             "slice/mel_org": utils.plot_spectrogram_to_numpy(y_mel[0].data.cpu().numpy()),
             "slice/mel_gen": utils.plot_spectrogram_to_numpy(y_hat_mel[0].data.cpu().numpy()), 
@@ -423,7 +420,7 @@ def evaluate(hps, generator, eval_loader, writer_eval, logger, hubert, residual_
             ((z, z_p, m_p), logs_p, m_q, logs_q) = generator(x, x_lengths, spec, spec_lengths, sin, d, slice_id, speakers, target_ids)
           y_mel = commons.slice_segments(mel, ids_slice, spec_segment_size)
           y_hat, y_reg = outs
-          tgt_y_hat, tgt_y_reg = tgt_outs
+          tgt_y_hat, _ = tgt_outs
           y_hat = y_hat.float()
           y_hat_mel = mel_spectrogram_torch_data(y_hat.squeeze(1), hps.data)
           #vc_o_r_hat_mel = mel_spectrogram_torch_data(vc_o_r_hat.float().squeeze(1), hps.data)

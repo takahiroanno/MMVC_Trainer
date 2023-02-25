@@ -331,6 +331,144 @@ class TextAudioSpeakerCollate():
             return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid, ids_sorted_decreasing, f0_padded, f0_lengths, in_batch, dfs_batch, slice_id
         return text_padded, text_lengths, spec_padded, spec_lengths, wav_padded, wav_lengths, sid, f0_padded, f0_lengths, in_batch, dfs_batch, slice_id
 
+"""
+FreeVC
+"""
+class TextAudioSpeakerLoaderFreeVC(torch.utils.data.Dataset):
+    """
+        1) loads audio, speaker_id, text pairs
+        2) normalizes text and converts them to sequences of integers
+        3) computes spectrograms from audio files.
+    """
+    def __init__(self, audiopaths, hparams):
+        self.audiopaths_sid_text = load_filepaths_and_text(audiopaths)
+        self.max_wav_value = hparams.data.max_wav_value
+        self.sampling_rate = hparams.data.sampling_rate
+        self.filter_length  = hparams.data.filter_length
+        self.hop_length     = hparams.data.hop_length
+        self.win_length     = hparams.data.win_length
+        self.sampling_rate  = hparams.data.sampling_rate
+        self.use_sr = hparams.train.use_sr
+        self.use_spk = hparams.model.use_spk
+        self.spec_len = hparams.train.max_speclen
+
+        random.seed(1234)
+        random.shuffle(self.audiopaths)
+        self._filter()
+
+    def _filter(self):
+        """
+        Filter text & store spec lengths
+        """
+        # Store spectrogram lengths for Bucketing
+        # wav_length ~= file_size / (wav_channels * Bytes per dim) = file_size / (1 * 2)
+        # spec_length = wav_length // hop_length
+
+        audiopaths_sid_text_new = []
+        lengths = []
+        
+        for audiopath, y_path in tqdm.tqdm(self.audiopaths_sid_text, disable=self.disable_tqdm):
+            audiopaths_sid_text_new.append([audiopath, y_path])
+            #ファイルのサイズをバイト単位で取得
+            lengths.append(os.path.getsize(audiopath) // (2 * self.hop_length))
+        self.audiopaths_sid_text = audiopaths_sid_text_new
+        self.lengths = lengths
+
+    def get_audio_text_speaker_pair(self, audiopath_sid_text):
+        # separate filename, speaker_id and text
+        audiopath, y_path = audiopath_sid_text[0], audiopath_sid_text[1]
+        text = self.get_text(y_path)
+        #DA、音量とピッチのみ機能再開、話速は使わないこと
+        spec, wav = self.get_audio(audiopath)
+        return (text, spec, wav)
+
+    def get_audio(self, filename):
+        audio, sampling_rate = load_wav_to_torch(filename)
+        try:
+            if sampling_rate != self.sampling_rate:
+                raise ValueError("[Error] Exception: source {} SR doesn't match target {} SR".format(
+                    sampling_rate, self.sampling_rate))
+        except ValueError as e:
+            print(e)
+            exit()
+        audio_norm = self.get_normalized_audio(audio, self.max_wav_value)
+        spec = spectrogram_torch(audio_norm, self.filter_length,
+            self.sampling_rate, self.hop_length, self.win_length,
+            center=False)
+        spec = torch.squeeze(spec, 0)
+        return spec, audio_norm
+
+    def get_text(self, text):
+        text_norm = torch.FloatTensor(np.load(text))
+        return text_norm
+
+    def get_normalized_audio(self, audio, max_wav_value):
+        audio_norm = audio / max_wav_value
+        audio_norm = audio_norm.unsqueeze(0)
+        return audio_norm
+
+    def __getitem__(self, index):
+        return self.get_audio(self.audiopaths[index][0])
+
+    def __len__(self):
+        return len(self.audiopaths)
+
+class TextAudioSpeakerCollateFreeVC():
+    """ Zero-pads model inputs and targets
+    """
+    def __init__(self, hps):
+        self.hps = hps
+
+    def __call__(self, batch):
+        """Collate's training batch from normalized text, audio and speaker identities
+        PARAMS
+        ------
+        batch: [text_normalized, spec_normalized, wav_normalized, sid]
+        """
+        # Right zero-pad all one-hot text sequences to max input length
+        _, ids_sorted_decreasing = torch.sort(
+            torch.LongTensor([x[0].size(1) for x in batch]),
+            dim=0, descending=True)
+
+        max_spec_len = max([x[1].size(1) for x in batch])
+        max_wav_len = max([x[2].size(1) for x in batch])
+
+        spec_lengths = torch.LongTensor(len(batch))
+        wav_lengths = torch.LongTensor(len(batch))
+        
+        c_padded = torch.FloatTensor(len(batch), batch[0][0].size(0), max_spec_len)
+        spec_padded = torch.FloatTensor(len(batch), batch[0][1].size(0), max_spec_len)
+        wav_padded = torch.FloatTensor(len(batch), 1, max_wav_len)
+        c_padded.zero_()
+        spec_padded.zero_()
+        wav_padded.zero_()
+        
+        for i in range(len(ids_sorted_decreasing)):
+            row = batch[ids_sorted_decreasing[i]]
+            
+            c = row[0]
+            c_padded[i, :, :c.size(1)] = c
+
+            spec = row[1]
+            spec_padded[i, :, :spec.size(1)] = spec
+            spec_lengths[i] = spec.size(1)
+
+            wav = row[2]
+            wav_padded[i, :, :wav.size(1)] = wav
+            wav_lengths[i] = wav.size(1)
+        
+        spec_seglen = spec_lengths[-1] if spec_lengths[-1] < self.hps.train.max_speclen + 1 else self.hps.train.max_speclen + 1
+        wav_seglen = spec_seglen * self.hps.data.hop_length 
+
+        spec_padded, ids_slice = commons.rand_spec_segments(spec_padded, spec_lengths, spec_seglen)
+        wav_padded = commons.slice_segments(wav_padded, ids_slice * self.hps.data.hop_length, wav_seglen)
+        
+        c_padded = commons.slice_segments(c_padded, ids_slice, spec_seglen)[:,:,:-1]
+    
+        spec_padded = spec_padded[:,:,:-1]
+        wav_padded = wav_padded[:,:,:-self.hps.data.hop_length]
+
+        return c_padded, spec_padded, wav_padded
 
 class DistributedBucketSampler(torch.utils.data.distributed.DistributedSampler):
     """
