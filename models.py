@@ -149,7 +149,7 @@ class Generator(torch.nn.Module):
             param.requires_grad = False
 
 
-    def forward(self, x, g=None):
+    def forward(self, x):
         x = self.conv_pre(x)
 
         for i in range(self.num_upsamples):
@@ -275,6 +275,47 @@ class MultiPeriodDiscriminator(torch.nn.Module):
 
             return y_d_gs            
 
+class SpeakerEncoder(torch.nn.Module):
+    def __init__(self, mel_n_channels=80, model_num_layers=3, model_hidden_size=256, model_embedding_size=256):
+        super(SpeakerEncoder, self).__init__()
+        self.lstm = nn.LSTM(mel_n_channels, model_hidden_size, model_num_layers, batch_first=True)
+        self.linear = nn.Linear(model_hidden_size, model_embedding_size)
+        self.relu = nn.ReLU()
+
+    def forward(self, mels):
+        self.lstm.flatten_parameters()
+        _, (hidden, _) = self.lstm(mels)
+        embeds_raw = self.relu(self.linear(hidden[-1]))
+        return embeds_raw / torch.norm(embeds_raw, dim=1, keepdim=True)
+        
+    def compute_partial_slices(self, total_frames, partial_frames, partial_hop):
+        mel_slices = []
+        for i in range(0, total_frames-partial_frames, partial_hop):
+            mel_range = torch.arange(i, i+partial_frames)
+            mel_slices.append(mel_range)
+            
+        return mel_slices
+    
+    def embed_utterance(self, mel, partial_frames=128, partial_hop=64):
+        mel_len = mel.size(1)
+        last_mel = mel[:,-partial_frames:]
+        
+        if mel_len > partial_frames:
+            mel_slices = self.compute_partial_slices(mel_len, partial_frames, partial_hop)
+            mels = list(mel[:,s] for s in mel_slices)
+            mels.append(last_mel)
+            mels = torch.stack(tuple(mels), 0).squeeze(1)
+        
+            with torch.no_grad():
+                partial_embeds = self(mels)
+            embed = torch.mean(partial_embeds, axis=0).unsqueeze(0)
+            #embed = embed / torch.linalg.norm(embed, 2)
+        else:
+            with torch.no_grad():
+                embed = self(last_mel)
+        
+        return embed
+
 
 class SynthesizerTrn(nn.Module):
   """
@@ -286,14 +327,15 @@ class SynthesizerTrn(nn.Module):
     segment_size,
     inter_channels,
     hidden_channels,
+    resblock, 
+    resblock_kernel_sizes, 
+    resblock_dilation_sizes, 
     upsample_rates, 
     upsample_initial_channel, 
     upsample_kernel_sizes,
     n_flow,
-    dec_out_channels=1,
-    dec_kernel_size=7,
-    n_speakers=0,
-    gin_channels=0,
+    gin_channels,
+    ssl_dim,
     requires_grad_pe=True,
     requires_grad_flow=True,
     requires_grad_text_enc=True,
@@ -302,14 +344,15 @@ class SynthesizerTrn(nn.Module):
 
     super().__init__()
     self.spec_channels = spec_channels
+    self.inter_channels = inter_channels
     self.hidden_channels = hidden_channels
+    self.resblock = resblock
+    self.resblock_kernel_sizes = resblock_kernel_sizes
+    self.resblock_dilation_sizes = resblock_dilation_sizes
     self.upsample_rates = upsample_rates
     self.upsample_initial_channel = upsample_initial_channel
     self.upsample_kernel_sizes = upsample_kernel_sizes
     self.segment_size = segment_size
-    self.dec_out_channels = dec_out_channels
-    self.dec_kernel_size = dec_kernel_size
-    self.n_speakers = n_speakers
     self.gin_channels = gin_channels
     self.requires_grad_pe = requires_grad_pe
     self.requires_grad_flow = requires_grad_flow
@@ -317,6 +360,15 @@ class SynthesizerTrn(nn.Module):
     self.requires_grad_dec = requires_grad_dec
     self.requires_grad_emb_g = requires_grad_emb_g
 
+    self.enc_p = PosteriorEncoder(
+        ssl_dim,
+        inter_channels, 
+        hidden_channels, 
+        5, 
+        1, 
+        16,  
+        requires_grad=requires_grad_pe
+        )
     self.enc_q = PosteriorEncoder(
         spec_channels, 
         inter_channels, 
@@ -324,20 +376,19 @@ class SynthesizerTrn(nn.Module):
         5, 
         1, 
         16, 
-        gin_channels=gin_channels, 
-        requires_grad=requires_grad_pe)
-    self.enc_p = TextEncoder(
-        inter_channels,
-        hidden_channels,
-        requires_grad=requires_grad_text_enc)
-    self.dec = SiFiGANGenerator(
-        in_channels=inter_channels,
-        out_channels=dec_out_channels,
-        channels=upsample_initial_channel,
-        kernel_size=dec_kernel_size,
-        upsample_scales=upsample_rates,
-        upsample_kernel_sizes=upsample_kernel_sizes,
-        requires_grad=requires_grad_dec)
+        gin_channels=gin_channels,
+        requires_grad=requires_grad_text_enc
+        )
+    self.dec = Generator(
+        inter_channels, 
+        resblock, 
+        resblock_kernel_sizes, 
+        resblock_dilation_sizes, 
+        upsample_rates, 
+        upsample_initial_channel, 
+        upsample_kernel_sizes,
+        requires_grad=requires_grad_dec
+        )
     self.flow = ResidualCouplingBlock(
         inter_channels, 
         hidden_channels, 
@@ -346,47 +397,45 @@ class SynthesizerTrn(nn.Module):
         4, 
         n_flows=n_flow, 
         gin_channels=gin_channels,
-        requires_grad=requires_grad_flow)
+        requires_grad=requires_grad_flow
+        )
+    self.enc_spk = SpeakerEncoder(
+        model_hidden_size=gin_channels, 
+        model_embedding_size=gin_channels
+        )
 
-    if n_speakers > 1:
-      self.emb_g = nn.Embedding(n_speakers, gin_channels)
-      self.emb_g.requires_grad = requires_grad_emb_g
+  def forward(self, c, spec, mel=None, c_lengths=None, spec_lengths=None):
+    #spk enc
+    g = self.enc_spk(mel.transpose(1,2))
+    g = g.unsqueeze(-1)
 
-  def forward(self, x, x_lengths, y, y_lengths, sin, d, slice_id, sid=None, target_ids=None):
-    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-    #target sid 作成
-    target_sids = self.make_random_target_sids(target_ids, sid)
-
-    if self.n_speakers > 0:
-      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
-      tgt_g = self.emb_g(target_sids).unsqueeze(-1) # [b, h, 1]
-    else:
-      g = None
+    #text enc
+    _, m_p, logs_p, _ = self.enc_p(c, c_lengths)
 
     #PE
-    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+    z, m_q, logs_q, spec_mask = self.enc_q(spec, spec_lengths, g=g) 
+
     #Flow
-    z_p = self.flow(z, y_mask, g=g)
-    #VC
-    tgt_z = self.flow(z_p, y_mask, g=tgt_g, reverse=True)
-    #アライメントの作成
-    liner_alignment = F.one_hot(torch.arange(0, x.shape[2]+2)).cuda()
-    liner_alignment = torch.stack([liner_alignment for _ in range(x.shape[0])], axis=0)
-    liner_alignment = F.interpolate(liner_alignment.float(), size=(z.shape[2]), mode='linear', align_corners=True)
-    liner_alignment = liner_alignment[:,1:-1,:]
-    #TextEncとPEのshape合わせ
-    m_p = torch.matmul(m_p, liner_alignment)
-    logs_p = torch.matmul(logs_p, liner_alignment)
+    z_p = self.flow(z, spec_mask, g=g)
 
-    #slice
-    z_slice = commons.slice_segments(z, slice_id, self.segment_size)
-    #targetのslice
-    tgt_z_slice = commons.slice_segments(tgt_z, slice_id, self.segment_size)
-    #Dec
-    o = self.dec(sin, z_slice, d, sid=g)
-    tgt_o = self.dec(sin, tgt_z_slice, d, sid=tgt_g)
+    #dec
+    z_slice, ids_slice = commons.rand_slice_segments(z, spec_lengths, self.segment_size)
+    o = self.dec(z_slice, g=g)
 
-    return (o, tgt_o), slice_id, x_mask, y_mask, ((z, z_p, m_p), logs_p, m_q, logs_q)
+    return o, ids_slice, spec_mask, (z, z_p, m_p, logs_p, m_q, logs_q)
+
+  def infer(self, c, g=None, mel=None, c_lengths=None):
+    if c_lengths == None:
+      c_lengths = (torch.ones(c.size(0)) * c.size(-1)).to(c.device)
+    if not self.use_spk:
+      g = self.enc_spk.embed_utterance(mel.transpose(1,2))
+    g = g.unsqueeze(-1)
+
+    z_p, m_p, logs_p, c_mask = self.enc_p(c, c_lengths)
+    z = self.flow(z_p, c_mask, g=g, reverse=True)
+    o = self.dec(z * c_mask, g=g)
+    
+    return o
 
   def make_random_target_sids(self, target_ids, sid):
     # target_sids は target_ids をランダムで埋める

@@ -340,7 +340,7 @@ class TextAudioSpeakerLoaderFreeVC(torch.utils.data.Dataset):
         2) normalizes text and converts them to sequences of integers
         3) computes spectrograms from audio files.
     """
-    def __init__(self, audiopaths, hparams):
+    def __init__(self, audiopaths, hparams, disable_tqdm = False):
         self.audiopaths_sid_text = load_filepaths_and_text(audiopaths)
         self.max_wav_value = hparams.data.max_wav_value
         self.sampling_rate = hparams.data.sampling_rate
@@ -350,10 +350,10 @@ class TextAudioSpeakerLoaderFreeVC(torch.utils.data.Dataset):
         self.sampling_rate  = hparams.data.sampling_rate
         self.use_sr = hparams.train.use_sr
         self.use_spk = hparams.model.use_spk
-        self.spec_len = hparams.train.max_speclen
+        self.disable_tqdm = disable_tqdm
 
         random.seed(1234)
-        random.shuffle(self.audiopaths)
+        random.shuffle(self.audiopaths_sid_text)
         self._filter()
 
     def _filter(self):
@@ -411,7 +411,10 @@ class TextAudioSpeakerLoaderFreeVC(torch.utils.data.Dataset):
         return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
 
     def __len__(self):
-        return len(self.audiopaths)
+        return len(self.audiopaths_sid_text)
+
+    def get_all_sid(self):
+        return list(set([int(r[1]) for r in self.audiopaths_sid_text]))
 
 class TextAudioSpeakerCollateFreeVC():
     """ Zero-pads model inputs and targets
